@@ -120,24 +120,27 @@ class RAGPipeline:
 
         prompt = f"""Answer the question about UC Berkeley EECS based on the context below.
 
+First, think step by step about what the question is asking. Identify the key entity or attribute being asked about. Then find the relevant information in the context and extract the precise answer.
+
 Rules:
-- Give ONLY the short answer (a name, number, date, or brief phrase under 10 words)
-- No explanation, no full sentences
+- After reasoning, give ONLY the final short answer (a name, number, date, or brief phrase under 10 words)
 - Extract the answer directly from the context when possible
-- For "how many" questions, answer with just the number
+- For counting questions, answer with just the number
 - For yes/no questions, answer Yes or No
-- For superlative questions (earliest, oldest, latest, most, etc.), carefully examine ALL items and compare their values (dates, numbers) before answering. For "earliest-born", find the person with the smallest birth year
-- Read the question carefully: if asked about "minor", answer about minor (not major). If asked about a specific person/topic, answer about that specific one
-- Include relevant qualifiers (e.g., "CS 161" not just "161")
+- For superlative questions, carefully compare ALL candidates before answering
+- Pay close attention to exactly what is being asked — do not confuse related but different attributes
+- Include full identifiers (e.g., "CS 161" not just "161", "Stanford University" not just "Stanford")
 
 Context:
 {context}
 
 Question: {question}
+
+Think step by step, then give ONLY the final answer on the last line.
 Answer:"""
 
         try:
-            answer = call_llm(prompt, model=self.model_name, max_tokens=30, temperature=0.0)
+            answer = call_llm(prompt, model=self.model_name, max_tokens=150, temperature=0.0)
             answer = self._clean_answer(answer)
             return answer
         except Exception as e:
@@ -145,17 +148,25 @@ Answer:"""
 
     @staticmethod
     def _clean_answer(answer):
-        """Clean up LLM answer to be a short extractive span."""
+        """Clean up LLM answer - extract final answer from CoT output."""
         if not answer:
             return ""
         answer = answer.strip()
-        # Take only the first line
-        answer = answer.split('\n')[0].strip()
+
+        # For CoT: take the LAST line as the final answer
+        lines = [l.strip() for l in answer.split('\n') if l.strip()]
+        if lines:
+            answer = lines[-1]
+
         # Remove common prefixes
-        for prefix in ['Answer:', 'The answer is:', 'The answer is', 'A:', 'A. ']:
+        for prefix in ['Answer:', 'The answer is:', 'The answer is',
+                       'Final answer:', 'A:', 'A. ', '**Answer:**',
+                       '**', 'So, ', 'Therefore, ', 'Thus, ']:
             if answer.lower().startswith(prefix.lower()):
                 answer = answer[len(prefix):].strip()
-        # Remove surrounding quotes
+
+        # Remove surrounding quotes/bold markers
+        answer = answer.strip('*').strip()
         if answer.startswith('"') and answer.endswith('"'):
             answer = answer[1:-1]
         if answer.startswith("'") and answer.endswith("'"):
