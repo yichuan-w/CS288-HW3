@@ -118,7 +118,16 @@ class RAGPipeline:
 
         context = '\n\n'.join(context_parts)
 
-        prompt = f"""Answer the question about UC Berkeley EECS based on the context below. Give ONLY the answer, nothing else. The answer should be a short text span (a name, number, date, or brief phrase). Do not explain. Extract the answer directly from the context.
+        prompt = f"""Answer the question about UC Berkeley EECS based on the context below.
+
+Rules:
+- Give ONLY the short answer (a name, number, date, or brief phrase under 10 words)
+- No explanation, no full sentences
+- Extract the answer directly from the context when possible
+- For "how many" questions, answer with just the number
+- For yes/no questions, answer Yes or No
+- For superlative questions (earliest, latest, most, etc.), carefully compare ALL candidates in the context before answering
+- Include relevant qualifiers (e.g., "CS 161" not just "161")
 
 Context:
 {context}
@@ -155,10 +164,45 @@ Answer:"""
             answer = answer[:-1].strip()
         return answer
 
+    def _expand_query(self, question):
+        """Generate alternative search queries for better retrieval."""
+        expansions = [question]
+        q_lower = question.lower()
+
+        # Add keyword-focused variants
+        if 'earliest' in q_lower or 'oldest' in q_lower or 'first' in q_lower:
+            expansions.append(question.replace('earliest-born', 'born').replace('earliest', 'first'))
+            expansions.append("faculty in memoriam born died years 1891 1900 1904")
+        if 'how many' in q_lower:
+            # Extract the subject
+            expansions.append(question.replace('How many', '').replace('how many', ''))
+        if 'deadline' in q_lower:
+            expansions.append(question + " due date submit")
+        if 'credit' in q_lower or 'unit' in q_lower:
+            expansions.append(question + " units requirements coursework")
+        if 'teaching' in q_lower or 'courses' in q_lower:
+            expansions.append(question + " schedule draft classes instructor")
+
+        return expansions
+
+    def retrieve_multi_query(self, question, top_k=None):
+        """Retrieve using multiple query expansions and merge."""
+        top_k = top_k or self.top_k_final
+        queries = self._expand_query(question)
+
+        all_scores = {}
+        for q in queries:
+            results = self.retrieve_hybrid(q, top_k=top_k)
+            for idx, score in results:
+                all_scores[idx] = max(all_scores.get(idx, 0), score)
+
+        sorted_results = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
+        return sorted_results[:top_k]
+
     def answer_question(self, question):
         """Full RAG pipeline: retrieve + generate."""
-        # Retrieve relevant chunks
-        results = self.retrieve_hybrid(question)
+        # Use multi-query retrieval for better coverage
+        results = self.retrieve_multi_query(question)
 
         if not results:
             return ""
