@@ -1,0 +1,10 @@
+Stanford University|Stanford
+2016
+725 Soda Hall|Soda 725
+36|36 hours
+unknown
+Soda Hall|Cory Hall
+unknown
+unknown
+Python
+4

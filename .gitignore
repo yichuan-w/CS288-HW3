@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+submission.zip
+data/raw_pages/
+data/reference/
+data/ref_*.txt

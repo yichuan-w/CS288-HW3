@@ -1,0 +1,10 @@
+Which university did Dan Klein receive his Ph.D.?
+Which year did Dan Klein receive the Grace Murray Hopper Award?
+What is the office number of Dan Klein?
+How many GSI hours do Berkeley EECS students need to obtain a doctoral degree?
+Who is the chair of the EECS department at UC Berkeley?
+What is the title of the EECS department's main building?
+Which email address should CS PhD students send their Ph.D. Student Review to?
+Who is the winner of the Eugene L. Lawler Prize in 2024-25?
+What programming language is used in CS 61A?
+How many units is CS 189?
