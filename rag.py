@@ -126,7 +126,8 @@ Rules:
 - Extract the answer directly from the context when possible
 - For "how many" questions, answer with just the number
 - For yes/no questions, answer Yes or No
-- For superlative questions (earliest, latest, most, etc.), carefully compare ALL candidates in the context before answering
+- For superlative questions (earliest, oldest, latest, most, etc.), carefully examine ALL items and compare their values (dates, numbers) before answering. For "earliest-born", find the person with the smallest birth year
+- Read the question carefully: if asked about "minor", answer about minor (not major). If asked about a specific person/topic, answer about that specific one
 - Include relevant qualifiers (e.g., "CS 161" not just "161")
 
 Context:
@@ -178,15 +179,16 @@ Answer:"""
             expansions.append(question.replace('How many', '').replace('how many', ''))
         if 'deadline' in q_lower:
             expansions.append(question + " due date submit")
-        if 'credit' in q_lower or 'unit' in q_lower:
-            expansions.append(question + " units requirements coursework")
+        if 'credit' in q_lower or 'unit' in q_lower or 'minor' in q_lower:
+            expansions.append("PhD coursework minor units requirements")
         if 'teaching' in q_lower or 'courses' in q_lower:
             expansions.append(question + " schedule draft classes instructor")
 
         return expansions
 
     def retrieve_multi_query(self, question, top_k=None):
-        """Retrieve using multiple query expansions and merge."""
+        """Retrieve using multiple query expansions and merge.
+        Also includes adjacent chunks for continuity."""
         top_k = top_k or self.top_k_final
         queries = self._expand_query(question)
 
@@ -195,6 +197,12 @@ Answer:"""
             results = self.retrieve_hybrid(q, top_k=top_k)
             for idx, score in results:
                 all_scores[idx] = max(all_scores.get(idx, 0), score)
+                # Also add adjacent chunks from same URL with slightly lower score
+                for adj in [idx - 1, idx + 1]:
+                    if 0 <= adj < len(self.chunks):
+                        if self.chunks[adj]['url'] == self.chunks[idx]['url']:
+                            adj_score = score * 0.8
+                            all_scores[adj] = max(all_scores.get(adj, 0), adj_score)
 
         sorted_results = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
         return sorted_results[:top_k]
