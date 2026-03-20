@@ -21,69 +21,75 @@ We created a QA dataset by manually browsing the EECS website and formulating fa
 
 ## Q2. Retrieval Corpus
 
-**Construction:** We built a BFS web crawler starting from 24 seed URLs across eecs.berkeley.edu and www2.eecs.berkeley.edu. The crawler uses BeautifulSoup4 with the lxml parser backend to extract clean text from HTML pages, removing script/style/noscript/iframe tags. Tables are extracted separately in a structured row|cell format. We crawled the main site until the BFS queue was empty (2,759 pages), and separately crawled www2.eecs.berkeley.edu (324 pages) for a total of 3,083 pages and 9.9M characters. A key challenge was that www2.eecs.berkeley.edu experienced intermittent downtime, requiring multiple crawl attempts.
+**Construction:** We built a BFS web crawler starting from 24 seed URLs across eecs.berkeley.edu and www2.eecs.berkeley.edu. The crawler uses BeautifulSoup4 to extract clean text from HTML, removing script/style tags. Tables are extracted separately. We crawled 3,083 pages total. We then merged 857 additional pages from the released reference corpus, prioritizing its cleaner text for 99 pages where our crawled data contained excessive HTML navigation boilerplate. The final corpus spans ~3,940 unique URLs.
 
-**Evaluation:** We verified corpus coverage by checking whether reference QA URLs existed in our corpus. For the 10 provided reference pairs, 8/10 source URLs were present after adding www2 data.
+**Ablation — Our Corpus vs. Reference Corpus:**
 
-**[To be completed after receiving reference corpus]:** Ablations comparing our corpus vs. reference corpus.
+| Corpus | Dev F1 |
+|--------|--------|
+| Our crawled corpus only (3,083 pages) | ~49% |
+| Reference corpus only (1,942 pages) | ~35% |
+| Merged (ours + reference new URLs + quality replacement) | ~53% |
+
+The reference corpus alone performed poorly due to lower page coverage. However, its text quality was superior — clean markdown without HTML boilerplate. The merged approach retained our broader coverage while benefiting from reference corpus quality for faculty homepages and publication pages.
 
 ## Q3. RAG System
 
-**Architecture:** Our system uses a hybrid retrieval pipeline with Reciprocal Rank Fusion (RRF):
+**Architecture:** Our final system uses a hybrid retrieval pipeline with multi-granularity chunking:
 
-1. **Chunking:** Pages are split into 150-word chunks with 50-word overlap. Tables are preserved as separate chunks.
-2. **Sparse Retrieval (BM25):** Using rank-bm25, we retrieve top-30 chunks by BM25 score.
-3. **Dense Retrieval (FAISS):** Using all-MiniLM-L6-v2 (22.7M parameters, 87MB) with FAISS IndexFlatIP (cosine similarity on normalized embeddings), we retrieve top-30 chunks.
-4. **Hybrid Fusion:** RRF with k=60 merges BM25 and dense results into top-10.
-5. **Adjacent Chunk Retrieval:** For each retrieved chunk, we also include its ±1 neighbors from the same page (with 0.8× score discount), preventing information loss at chunk boundaries.
-6. **Multi-Query Expansion:** We generate alternative search queries for specific question types (e.g., appending domain-specific keywords like "coursework requirements" for credit-related queries) to improve recall.
-7. **Generator:** Qwen-2.5-7B-Instruct via OpenRouter. The prompt explicitly forbids refusal answers ("not provided", "unknown") and forces a best-guess short answer.
+1. **Multi-Granularity Chunking:** Primary chunks are 300 words with 50-word overlap. We additionally create 100-word chunks (20-word overlap) for all pages, enabling precise retrieval of specific facts (e.g., individual awards, contact info) that get diluted in larger chunks. Total: ~27K chunks.
+2. **Sparse Retrieval (BM25):** Top-50 chunks by BM25 score.
+3. **Dense Retrieval (FAISS):** all-MiniLM-L6-v2 (22.7M params, 87MB) with FAISS IndexFlatIP. Top-50 chunks.
+4. **Hybrid Fusion:** RRF (k=60) merges BM25 and dense results into top-15.
+5. **Adjacent Chunk Retrieval:** For each retrieved chunk, ±2 neighbors from the same page are included (0.7x score discount).
+6. **Multi-Query Expansion:** Key terms are extracted from the question (stop-word removal) and used as an additional keyword query. For "how many" questions, the counting phrase is stripped to focus on the subject.
+7. **Generator:** Qwen3-8B via OpenRouter with `/no_think` to disable chain-of-thought. The prompt forbids refusal answers and forces short extractive spans. Context window is 6000 characters.
 
 **Key Design Decisions:**
 - Hybrid retrieval outperformed either BM25 or dense retrieval alone (see Q4).
-- Adjacent chunk retrieval was critical for handling chunk boundary issues, improving F1 by ~10%.
-- After testing CoT prompting, we found direct answering with a no-refusal constraint performed better — CoT made the model overly cautious, producing 39% refusal answers on the hidden test set.
+- We found that **avoiding dev-set-specific tuning** (e.g., hardcoded query expansions, question-type-specific prompt branches) was critical for generalization. An earlier version with dev-tuned query expansions scored 53% on dev but only 43% on test; simplifying to generic retrieval improved test F1 to 52.5% despite a small dev decrease.
 
 ## Q4. Ablations
 
-**Ablation 1: Retrieval Method (BM25 vs. Dense vs. Hybrid)**
+**Ablation 1: Generalization vs. Dev-Set Tuning**
 
-| Method | EM | F1 |
-|--------|-----|-----|
-| BM25 only | 40% | 46.7% |
-| Dense only | 50% | 56.7% |
-| Hybrid (RRF) | 60% | 66.7% |
+| Approach | Dev F1 | Test F1 |
+|----------|--------|---------|
+| Dev-tuned (hardcoded query expansions, question-type prompts) | 53% | 43% |
+| Generic (keyword extraction only, uniform prompt) | 49% | 52.5% |
 
-Hybrid retrieval with RRF consistently outperformed individual methods. BM25 excels at keyword matching but misses semantically related passages. Dense retrieval captures semantic similarity but can be distracted by topically similar but irrelevant pages. RRF effectively combines both strengths.
+This was our most surprising finding. Dev-specific optimizations (e.g., adding "faculty in memoriam born died years 1891" as a query expansion for "earliest-born" questions) improved dev scores but severely hurt test generalization. The generic approach with simple keyword extraction outperformed on the unseen test set by nearly 10%.
 
-**Ablation 2: Prompt Strategy (CoT vs. Direct + No-Refusal)**
+**Ablation 2: LLM Model (Qwen 2.5 7B vs. Qwen3 8B)**
 
-| Prompt Strategy | Dev F1 (Gradescope) | Test F1 (Gradescope) |
-|-----------------|---------------------|----------------------|
-| CoT ("think step by step") | 47.6% | 35.9% |
-| Direct + no-refusal constraint | TBD | TBD |
+| Model | Dev F1 | Test F1 |
+|-------|--------|---------|
+| Qwen-2.5-7B-Instruct | ~49% | — |
+| Qwen3-8B (`/no_think`) | ~53% | ~52% |
+| Llama-3.1-8B-Instruct | ~46% | — |
 
-CoT prompting caused the model to overthink and produce refusal answers ("not provided", "no information") for 39% of questions. Switching to direct answering with an explicit no-refusal constraint ("NEVER say not provided, give your best guess") significantly reduced empty/refusal answers. This was our most impactful finding: for short-answer QA with small models, direct extraction outperforms chain-of-thought reasoning.
+Qwen3-8B with thinking disabled was the strongest model. Notably, Qwen3's default thinking mode was counterproductive — it caused slow responses and verbose reasoning that degraded short-answer extraction. The `/no_think` flag was essential for both speed and accuracy.
 
 ## Q5. Error Analysis
 
-We analyzed predictions from our first Gradescope submission (Dev F1=47.6%, Test F1=35.9%). On the 100-question hidden test set:
+We analyzed 100 hidden dev set predictions from our best model (Qwen3-8B, Dev F1≈49%). We categorized errors using retrieval diagnostics — checking whether the answer string exists in retrieved chunks, in the corpus, or is entirely missing.
 
 | Error Category | Count | Example |
 |----------------|-------|---------|
-| LLM refusal ("No", "Not provided") | 39 | "No information provided about the title of Tan Nguyen's PhD thesis" |
-| Missing data (www2 downtime) | ~10 | Faculty homepages, course schedules on www2 |
-| Wrong retrieval (irrelevant chunks) | ~15 | Retrieving news articles instead of specific faculty/course pages |
-| LLM reasoning error | ~8 | Confusing Major (12+ units) with Minor (6+ units) |
-| False negative (metric limitation) | ~5 | "Stanford" vs "Stanford University" (F1=0.67), "6+ units" vs "6+" (F1=0.67) |
+| Retrieval has answer, LLM wrong | ~25 | Q: "How many Turing winners?" Pred: 6 vs. Ref: 9 — LLM undercounts |
+| Retrieval miss, corpus has answer | ~18 | Q: "Dan Klein fellowship in 2007?" — chunk ranks >200th despite containing "Sloan Research Fellowship" |
+| Corpus missing entirely | ~2 | Q: "Who earned a PhD in 1935?" — page not crawled |
+| Metric limitation | ~4 | "brewer@cs.berkeley.edu" vs "brewer@cs" (F1=0) |
 
-The dominant error (39%) was LLM refusals. **Metric limitation** false negatives include: partial string matches that are semantically correct (e.g., "KU Leuven (Belgium)" vs. "KU Leuven"), and format differences ("6+ units" vs. "6+"). We propose: (1) substring/superstring acceptance, (2) synonym normalization (e.g., stripping parenthetical qualifiers), and (3) LLM-as-judge for borderline cases.
+The dominant error source is the LLM extracting incorrect information from context that does contain the answer (25 cases). Retrieval misses (18 cases) occur when answer-bearing chunks rank too low — often because the answer is in a large, topic-diverse chunk where the signal is diluted.
+
+**Metric limitations:** The token-level F1 metric penalizes format differences that are semantically equivalent. We propose: (1) substring acceptance for email/phone formats, (2) time normalization (e.g., "11 am" = "11:00am"), and (3) LLM-as-judge evaluation for borderline cases.
 
 ## Q6. Takeaways & Future Ideas
 
-**Key Takeaways:** (1) Prompt engineering has outsized impact on small LLMs — a single instruction ("never refuse") eliminated 39% of errors. (2) Data availability is unpredictable — www2.eecs.berkeley.edu intermittent downtime caused significant coverage gaps. (3) Chunk boundary handling is critical; adjacent chunk retrieval provided ~10% F1 gain. (4) Hybrid retrieval is robust; neither sparse nor dense retrieval alone suffices.
+**Key Takeaways:** (1) **Avoiding overfitting to the dev set was our most important lesson** — simplifying our pipeline improved test F1 by 10% despite lowering dev scores. (2) Multi-granularity chunking improved retrieval precision for specific facts without sacrificing broad context. (3) Corpus quality matters: replacing boilerplate-heavy pages with clean reference text improved F1 by ~4%. (4) Newer models (Qwen3 vs. 2.5) provide meaningful gains (~4% F1) with no code changes. (5) Chain-of-thought hurts small models on extractive QA — direct answering with anti-refusal constraints works better.
 
-**Future Ideas:** (1) Use an LLM to generate synthetic QA pairs from crawled pages for retrieval fine-tuning. (2) Implement a cross-encoder re-ranking stage. (3) Use semantic chunking (split at paragraph/section boundaries) instead of fixed word count. (4) Explore query decomposition for multi-hop questions. (5) Fine-tune the embedding model on EECS domain data.
+**Future Ideas:** (1) Cross-encoder re-ranking to improve retrieval precision — this could address the 25 cases where the answer is in context but the LLM picks wrong info. (2) Semantic chunking at section/heading boundaries instead of fixed word count. (3) Two-pass generation for counting questions: first enumerate candidates, then count. (4) Fine-tune the embedding model on EECS domain QA pairs. (5) Entity-aware retrieval: extract named entities from questions and do targeted chunk lookup.
 
 ---
 

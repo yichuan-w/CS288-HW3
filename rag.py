@@ -5,6 +5,7 @@ RAG pipeline: retrieval + generation for QA over EECS Berkeley data.
 import os
 import json
 import pickle
+import re
 import numpy as np
 import faiss
 from rank_bm25 import BM25Okapi
@@ -15,12 +16,11 @@ from llm import call_llm
 class RAGPipeline:
     def __init__(self, datastore_dir='data/datastore',
                  model_name=None,
-                 top_k_bm25=30,
-                 top_k_dense=30,
-                 top_k_final=10):
-        # Use env var for model name, default to OpenRouter format for submission
+                 top_k_bm25=50,
+                 top_k_dense=50,
+                 top_k_final=15):
         if model_name is None:
-            self.model_name = os.environ.get('LLM_MODEL', 'qwen/qwen-2.5-7b-instruct')
+            self.model_name = os.environ.get('LLM_MODEL', 'qwen/qwen3-8b')
         else:
             self.model_name = model_name
         self.top_k_bm25 = top_k_bm25
@@ -34,26 +34,21 @@ class RAGPipeline:
         """Load all datastore components."""
         print("Loading datastore...")
 
-        # Load config
         config_file = os.path.join(self.datastore_dir, 'config.json')
         with open(config_file, 'r') as f:
             self.config = json.load(f)
 
-        # Load chunks
         chunks_file = os.path.join(self.datastore_dir, 'chunks.json')
         with open(chunks_file, 'r', encoding='utf-8') as f:
             self.chunks = json.load(f)
 
-        # Load BM25
         bm25_file = os.path.join(self.datastore_dir, 'bm25.pkl')
         with open(bm25_file, 'rb') as f:
             self.bm25 = pickle.load(f)
 
-        # Load FAISS index
         faiss_file = os.path.join(self.datastore_dir, 'faiss_index.bin')
         self.faiss_index = faiss.read_index(faiss_file)
 
-        # Load embedding model - try local path first, then HF hub
         script_dir = os.path.dirname(os.path.abspath(__file__))
         local_model_path = os.path.join(script_dir, 'data', 'embedding_model')
         if os.path.exists(local_model_path):
@@ -88,7 +83,6 @@ class RAGPipeline:
         bm25_results = self.retrieve_bm25(query, self.top_k_bm25)
         dense_results = self.retrieve_dense(query, self.top_k_dense)
 
-        # Reciprocal Rank Fusion (RRF)
         k = 60  # RRF constant
         scores = {}
 
@@ -98,16 +92,29 @@ class RAGPipeline:
         for rank, (idx, _) in enumerate(dense_results):
             scores[idx] = scores.get(idx, 0) + 1.0 / (k + rank + 1)
 
-        # Sort by combined score
         sorted_results = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return sorted_results[:top_k]
 
+    def _extract_key_terms(self, question):
+        """Extract key terms from the question (remove stop words)."""
+        stop_words = {
+            'what', 'which', 'who', 'whom', 'where', 'when', 'how', 'is', 'are',
+            'was', 'were', 'do', 'does', 'did', 'the', 'a', 'an', 'in', 'of',
+            'for', 'to', 'at', 'on', 'by', 'from', 'with', 'about', 'that',
+            'this', 'it', 'its', 'can', 'could', 'will', 'would', 'should',
+            'may', 'might', 'much', 'many', 'long', 'if', 'has', 'have', 'had',
+            'be', 'been', 'being', 'and', 'or', 'not', 'no', 'you', 'your',
+            'i', 'me', 'my', 'we', 'our', 'they', 'their', 'there', 'get',
+        }
+        words = re.findall(r'\b\w+\b', question)
+        return [w for w in words if w.lower() not in stop_words]
+
     def generate_answer(self, question, context_chunks):
         """Generate answer using LLM with retrieved context."""
-        # Build context string - limit to avoid token overflow
+        # Build context string
         context_parts = []
         total_len = 0
-        max_context_len = 4000  # chars, to stay within token limits
+        max_context_len = 6000
         for i, (idx, score) in enumerate(context_chunks):
             chunk = self.chunks[idx]
             part = f"[{i+1}] {chunk['text']}"
@@ -120,20 +127,25 @@ class RAGPipeline:
 
         prompt = f"""Answer the question about UC Berkeley EECS using the context below.
 
-Important: You MUST give a short, concrete answer. NEVER say "not provided", "no information", "unknown", or "cannot determine". If unsure, give your best guess from the context.
+Important: You MUST give a short, concrete answer. NEVER say "not provided", "no information", "unknown", "not mentioned", or "cannot determine". Always give your best guess from the context.
 
 Rules:
 - Answer with a short span: a name, number, date, or phrase (under 10 words)
 - For yes/no questions, answer only Yes or No
-- For counting questions, answer with just the number
-- For superlative questions (earliest, most, etc.), compare ALL candidates carefully
+- For counting questions, count carefully and answer with just the number
+- For questions about a specific person, find that exact person's information
 - Include full identifiers (e.g., "CS 161" not "161")
+- Do NOT explain your answer
 
 Context:
 {context}
 
 Question: {question}
 Answer:"""
+
+        # Disable thinking mode for Qwen3
+        if 'qwen3' in self.model_name.lower():
+            prompt += " /no_think"
 
         try:
             answer = call_llm(prompt, model=self.model_name, max_tokens=50, temperature=0.0)
@@ -152,13 +164,19 @@ Answer:"""
         # Take only the first line
         answer = answer.split('\n')[0].strip()
 
-        # Remove common prefixes
-        for prefix in ['Answer:', 'The answer is:', 'The answer is',
-                       'Final answer:', 'A:', 'A. ', '**Answer:**',
-                       '**', 'So, ', 'Therefore, ', 'Thus, ',
-                       'Based on the context, ', 'According to the context, ']:
-            if answer.lower().startswith(prefix.lower()):
-                answer = answer[len(prefix):].strip()
+        # Remove common prefixes (iterate)
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ['Answer:', 'The answer is:', 'The answer is',
+                           'Final answer:', 'A:', 'A. ', '**Answer:**',
+                           '**', 'So, ', 'Therefore, ', 'Thus, ',
+                           'Based on the context, ', 'According to the context, ',
+                           'Based on the provided context, ',
+                           'From the context, ']:
+                if answer.lower().startswith(prefix.lower()):
+                    answer = answer[len(prefix):].strip()
+                    changed = True
 
         # Remove surrounding quotes/bold markers
         answer = answer.strip('*').strip()
@@ -166,29 +184,36 @@ Answer:"""
             answer = answer[1:-1]
         if answer.startswith("'") and answer.endswith("'"):
             answer = answer[1:-1]
-        # Remove trailing period
         if answer.endswith('.'):
             answer = answer[:-1].strip()
+
+        # Detect refusals
+        refusal_patterns = [
+            'not provided', 'not mentioned', 'no information',
+            'cannot determine', 'not specified', 'not stated',
+            'not available', 'not found in', 'not clear from',
+            'cannot be determined', 'insufficient information',
+        ]
+        answer_lower = answer.lower()
+        for pattern in refusal_patterns:
+            if pattern in answer_lower:
+                return ""
+
         return answer
 
     def _expand_query(self, question):
-        """Generate alternative search queries for better retrieval."""
+        """Generate alternative search queries — generic, no hardcoded patterns."""
         expansions = [question]
-        q_lower = question.lower()
 
-        # Add keyword-focused variants
-        if 'earliest' in q_lower or 'oldest' in q_lower or 'first' in q_lower:
-            expansions.append(question.replace('earliest-born', 'born').replace('earliest', 'first'))
-            expansions.append("faculty in memoriam born died years 1891 1900 1904")
+        # Keyword-only version (helps BM25)
+        key_terms = self._extract_key_terms(question)
+        if len(key_terms) >= 2:
+            expansions.append(' '.join(key_terms))
+
+        # Strip "how many" to focus on the subject
+        q_lower = question.lower()
         if 'how many' in q_lower:
-            # Extract the subject
             expansions.append(question.replace('How many', '').replace('how many', ''))
-        if 'deadline' in q_lower:
-            expansions.append(question + " due date submit")
-        if 'credit' in q_lower or 'unit' in q_lower or 'minor' in q_lower:
-            expansions.append("PhD coursework minor units requirements")
-        if 'teaching' in q_lower or 'courses' in q_lower:
-            expansions.append(question + " schedule draft classes instructor")
 
         return expansions
 
@@ -203,11 +228,11 @@ Answer:"""
             results = self.retrieve_hybrid(q, top_k=top_k)
             for idx, score in results:
                 all_scores[idx] = max(all_scores.get(idx, 0), score)
-                # Also add adjacent chunks from same URL with slightly lower score
-                for adj in [idx - 1, idx + 1]:
+                # Include ±2 adjacent chunks from same page
+                for adj in [idx - 1, idx + 1, idx - 2, idx + 2]:
                     if 0 <= adj < len(self.chunks):
                         if self.chunks[adj]['url'] == self.chunks[idx]['url']:
-                            adj_score = score * 0.8
+                            adj_score = score * 0.7
                             all_scores[adj] = max(all_scores.get(adj, 0), adj_score)
 
         sorted_results = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
@@ -215,13 +240,9 @@ Answer:"""
 
     def answer_question(self, question):
         """Full RAG pipeline: retrieve + generate."""
-        # Use multi-query retrieval for better coverage
         results = self.retrieve_multi_query(question)
-
         if not results:
             return ""
-
-        # Generate answer
         answer = self.generate_answer(question, results)
         return answer
 
@@ -237,20 +258,16 @@ def main():
     questions_file = sys.argv[1]
     output_file = sys.argv[2]
 
-    # Read questions
     with open(questions_file, 'r', encoding='utf-8') as f:
         questions = [line.strip() for line in f if line.strip()]
 
     print(f"Loaded {len(questions)} questions")
 
-    # Initialize RAG pipeline
-    # Determine datastore dir relative to this script
     script_dir = os.path.dirname(os.path.abspath(__file__))
     datastore_dir = os.path.join(script_dir, 'data', 'datastore')
 
     rag = RAGPipeline(datastore_dir=datastore_dir)
 
-    # Answer each question with timeout
     import signal
 
     def timeout_handler(signum, frame):
@@ -260,24 +277,21 @@ def main():
     for i, question in enumerate(questions):
         print(f"[{i+1}/{len(questions)}] {question}")
         try:
-            # Set 45 second timeout per question
             signal.signal(signal.SIGALRM, timeout_handler)
             signal.alarm(45)
             answer = rag.answer_question(question)
-            signal.alarm(0)  # Cancel alarm
+            signal.alarm(0)
         except (TimeoutError, Exception) as e:
             print(f"  Error: {e}")
             signal.alarm(0)
             answer = ""
 
-        # Ensure no newlines in answer
         answer = answer.replace('\n', ' ').strip()
         if not answer:
             answer = "unknown"
         answers.append(answer)
         print(f"  -> {answer}")
 
-    # Write answers
     with open(output_file, 'w', encoding='utf-8') as f:
         for answer in answers:
             f.write(answer + '\n')
