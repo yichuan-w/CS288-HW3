@@ -16,9 +16,9 @@ from llm import call_llm
 class RAGPipeline:
     def __init__(self, datastore_dir='data/datastore',
                  model_name=None,
-                 top_k_bm25=50,
-                 top_k_dense=50,
-                 top_k_final=15):
+                 top_k_bm25=30,
+                 top_k_dense=30,
+                 top_k_final=12):
         if model_name is None:
             self.model_name = os.environ.get('LLM_MODEL', 'qwen/qwen3-8b')
         else:
@@ -114,7 +114,7 @@ class RAGPipeline:
         # Build context string
         context_parts = []
         total_len = 0
-        max_context_len = 6000
+        max_context_len = 8000
         for i, (idx, score) in enumerate(context_chunks):
             chunk = self.chunks[idx]
             part = f"[{i+1}] {chunk['text']}"
@@ -218,8 +218,7 @@ Answer:"""
         return expansions
 
     def retrieve_multi_query(self, question, top_k=None):
-        """Retrieve using multiple query expansions and merge.
-        Also includes adjacent chunks for continuity."""
+        """Retrieve using multiple query expansions and merge."""
         top_k = top_k or self.top_k_final
         queries = self._expand_query(question)
 
@@ -228,12 +227,6 @@ Answer:"""
             results = self.retrieve_hybrid(q, top_k=top_k)
             for idx, score in results:
                 all_scores[idx] = max(all_scores.get(idx, 0), score)
-                # Include ±2 adjacent chunks from same page
-                for adj in [idx - 1, idx + 1, idx - 2, idx + 2]:
-                    if 0 <= adj < len(self.chunks):
-                        if self.chunks[adj]['url'] == self.chunks[idx]['url']:
-                            adj_score = score * 0.7
-                            all_scores[adj] = max(all_scores.get(adj, 0), adj_score)
 
         sorted_results = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
         return sorted_results[:top_k]
