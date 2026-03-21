@@ -1,1 +1,7 @@
-{"embedding_model": "all-MiniLM-L6-v2", "chunk_size": 300, "overlap": 50, "num_chunks": 27082, "embedding_dim": 384}
+{
+  "embedding_model": "all-MiniLM-L6-v2",
+  "chunk_size": 300,
+  "overlap": 50,
+  "num_chunks": 27364,
+  "embedding_dim": 384
+}

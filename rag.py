@@ -18,7 +18,7 @@ class RAGPipeline:
                  model_name=None,
                  top_k_bm25=50,
                  top_k_dense=50,
-                 top_k_final=15):
+                 top_k_final=17):
         if model_name is None:
             self.model_name = os.environ.get('LLM_MODEL', 'qwen/qwen3-8b')
         else:
@@ -27,8 +27,10 @@ class RAGPipeline:
         self.top_k_dense = top_k_dense
         self.top_k_final = top_k_final
         self.datastore_dir = datastore_dir
+        self.reranker = None
 
         self._load_datastore()
+        self._load_reranker()
 
     def _load_datastore(self):
         """Load all datastore components."""
@@ -58,7 +60,57 @@ class RAGPipeline:
         print(f"Loading embedding model: {embedding_model_name}...")
         self.embedder = SentenceTransformer(embedding_model_name)
 
+        # Build URL -> chunk index mapping for fast URL boosting
+        self.url_to_chunks = {}
+        for i, chunk in enumerate(self.chunks):
+            url = chunk['url']
+            if url not in self.url_to_chunks:
+                self.url_to_chunks[url] = []
+            self.url_to_chunks[url].append(i)
+
         print(f"Datastore loaded: {len(self.chunks)} chunks")
+
+    def _load_reranker(self):
+        """Load cross-encoder re-ranker if available."""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        local_reranker = os.path.join(script_dir, 'data', 'cross_encoder_model')
+        try:
+            from sentence_transformers import CrossEncoder
+            if os.path.exists(local_reranker):
+                self.reranker = CrossEncoder(local_reranker)
+            else:
+                self.reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+            print("Cross-encoder re-ranker loaded")
+        except Exception as e:
+            print(f"No re-ranker available: {e}")
+            self.reranker = None
+
+    def rerank(self, question, results, top_k=None, blend_weight=0.5):
+        """Re-rank results using cross-encoder blended with original scores."""
+        top_k = top_k or self.top_k_final
+        if not self.reranker or not results:
+            return results[:top_k]
+
+        pairs = [(question, self.chunks[idx]['text']) for idx, _ in results]
+        ce_scores = self.reranker.predict(pairs)
+
+        # Normalize both score sets to [0, 1]
+        orig_scores = np.array([s for _, s in results])
+        if orig_scores.max() > orig_scores.min():
+            orig_norm = (orig_scores - orig_scores.min()) / (orig_scores.max() - orig_scores.min())
+        else:
+            orig_norm = np.ones_like(orig_scores)
+
+        ce_arr = np.array(ce_scores)
+        if ce_arr.max() > ce_arr.min():
+            ce_norm = (ce_arr - ce_arr.min()) / (ce_arr.max() - ce_arr.min())
+        else:
+            ce_norm = np.ones_like(ce_arr)
+
+        # Blend: higher weight = more cross-encoder influence
+        blended = (1 - blend_weight) * orig_norm + blend_weight * ce_norm
+        ranked = sorted(zip(results, blended), key=lambda x: x[1], reverse=True)
+        return [(idx, float(score)) for (idx, _), score in ranked[:top_k]]
 
     def retrieve_bm25(self, query, top_k=None):
         """Retrieve top-k chunks using BM25."""
@@ -129,13 +181,15 @@ class RAGPipeline:
 
 CRITICAL RULES:
 1. Give the SHORTEST possible answer: a name, number, date, or short phrase.
-2. Use digits for numbers (e.g., "4" not "Four").
+2. Use digits for numbers (e.g., "4" not "Four", "2016" not "two thousand sixteen").
 3. For yes/no questions, answer ONLY "Yes" or "No".
-4. For counting questions, carefully count ALL matching items in the context.
-5. Use FULL names with middle initials exactly as they appear in context.
-6. Include full identifiers (e.g., "CS 161" not "161", "EE 247A" not "EE 247").
-7. Do NOT add explanations. Do NOT start with "The" or "It is". Just the answer.
-8. You MUST give an answer. NEVER say "unknown", "not provided", or "cannot determine".
+4. For counting questions, carefully count ALL matching items in the context. List them out then count.
+5. Use FULL names with middle initials exactly as they appear in context (e.g., "Donald O. Pederson" not "Donald Pederson").
+6. Include full course identifiers exactly as written (e.g., "CS 161" not "161", "EE 247A" not "EE 247").
+7. Do NOT add explanations, qualifiers, or extra words. Just the bare answer.
+8. If asked for ONE item, give exactly ONE (the most relevant). Do NOT list multiple items separated by "and".
+9. You MUST give an answer from the context. NEVER say "unknown", "not provided", or "cannot determine".
+10. Copy exact strings from the context. Do NOT paraphrase or reformat.
 
 Context:
 {context}
@@ -198,6 +252,29 @@ Answer:"""
         if answer.endswith('.'):
             answer = answer[:-1].strip()
 
+        # Strip trailing title/role after comma (e.g., "John Smith, Director of X" → "John Smith")
+        if ', ' in answer:
+            parts = answer.split(', ')
+            # Only strip if first part looks like a name (2-4 words, capitalized)
+            first = parts[0].strip()
+            role_words = {'director', 'professor', 'chair', 'dean', 'manager', 'head',
+                         'coordinator', 'advisor', 'associate', 'assistant', 'senior',
+                         'vice', 'chief', 'officer', 'staff', 'specialist'}
+            rest = ', '.join(parts[1:]).lower()
+            if (2 <= len(first.split()) <= 4 and
+                any(w in rest for w in role_words)):
+                answer = first
+
+        # If answer contains " and " joining two short entities, keep only the first
+        # (many gold answers are pipe-delimited alternatives where either one is correct)
+        # Only split short answers (<=5 words total) where both parts are <=2 words
+        if ' and ' in answer and answer.count(' and ') == 1:
+            parts = answer.split(' and ')
+            p0, p1 = parts[0].strip(), parts[1].strip()
+            total_words = len(answer.split())
+            if total_words <= 5 and len(p0.split()) <= 3 and len(p1.split()) <= 3:
+                answer = p0
+
         # Convert number words to digits
         number_words = {
             'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4',
@@ -246,7 +323,7 @@ Answer:"""
         return expansions
 
     def retrieve_multi_query(self, question, top_k=None):
-        """Retrieve using multiple query expansions and merge."""
+        """Retrieve using multiple query expansions, merge, and re-rank."""
         top_k = top_k or self.top_k_final
         queries = self._expand_query(question)
 
@@ -269,13 +346,36 @@ Answer:"""
         top_url = self.chunks[results[0][0]]['url']
         result_idxs = set(idx for idx, _ in results)
 
-        # Find all chunks from the same URL
+        # Find all chunks from the same URL using pre-built index
         boosted = list(results)
-        for i, chunk in enumerate(self.chunks):
-            if chunk['url'] == top_url and i not in result_idxs:
-                boosted.append((i, 0.001))  # low score but included
+        for i in self.url_to_chunks.get(top_url, []):
+            if i not in result_idxs:
+                boosted.append((i, 0.001))
 
         return boosted[:top_k * 2]  # allow more chunks for counting
+
+    def _add_adjacent_chunks(self, results, n_top=3):
+        """Add neighboring chunks for the top N results only."""
+        result_idxs = set(idx for idx, _ in results)
+        added_idxs = set()
+        adjacent = []
+        for idx, score in results[:n_top]:
+            chunk = self.chunks[idx]
+            url = chunk['url']
+            sw = chunk.get('start_word', -1)
+            if sw == -1 or sw == '-1':
+                continue
+            for neighbor_idx in self.url_to_chunks.get(url, []):
+                if neighbor_idx in result_idxs or neighbor_idx in added_idxs:
+                    continue
+                n_chunk = self.chunks[neighbor_idx]
+                n_sw = n_chunk.get('start_word', -1)
+                if n_sw == -1 or n_sw == '-1':
+                    continue
+                if abs(int(n_sw) - int(sw)) <= 300:
+                    adjacent.append((neighbor_idx, score * 0.5))
+                    added_idxs.add(neighbor_idx)
+        return list(results) + adjacent
 
     def answer_question(self, question):
         """Full RAG pipeline: retrieve + generate."""
@@ -304,7 +404,69 @@ Answer:"""
             expanded = self._boost_same_url(results, top_k=self.top_k_final * 2)
             answer = self.generate_answer(question, expanded)
 
+        # Self-consistency: generate additional answers and pick majority
+        if answer and os.environ.get('SELF_CONSISTENCY', ''):
+            from collections import Counter
+            answers = [answer]
+            for _ in range(2):
+                a2 = self._generate_with_temp(question, results, temperature=0.3)
+                if a2:
+                    answers.append(a2)
+            if len(answers) > 1:
+                # Pick most common, fallback to first (temperature=0)
+                counts = Counter(a.lower().strip() for a in answers)
+                best = counts.most_common(1)[0][0]
+                # Find the original-cased version
+                for a in answers:
+                    if a.lower().strip() == best:
+                        answer = a
+                        break
+
         return answer
+
+    def _generate_with_temp(self, question, context_chunks, temperature=0.3):
+        """Generate answer with non-zero temperature for self-consistency."""
+        context_parts = []
+        total_len = 0
+        max_context_len = 12000
+        for i, (idx, score) in enumerate(context_chunks):
+            chunk = self.chunks[idx]
+            part = f"[{i+1}] {chunk['text']}"
+            if total_len + len(part) > max_context_len:
+                break
+            context_parts.append(part)
+            total_len += len(part)
+        context = '\n\n'.join(context_parts)
+
+        prompt = f"""You are answering factual questions about UC Berkeley EECS. Use ONLY the context below.
+
+CRITICAL RULES:
+1. Give the SHORTEST possible answer: a name, number, date, or short phrase.
+2. Use digits for numbers (e.g., "4" not "Four", "2016" not "two thousand sixteen").
+3. For yes/no questions, answer ONLY "Yes" or "No".
+4. For counting questions, carefully count ALL matching items in the context. List them out then count.
+5. Use FULL names with middle initials exactly as they appear in context (e.g., "Donald O. Pederson" not "Donald Pederson").
+6. Include full course identifiers exactly as written (e.g., "CS 161" not "161", "EE 247A" not "EE 247").
+7. Do NOT add explanations, qualifiers, or extra words. Just the bare answer.
+8. If asked for ONE item, give exactly ONE (the most relevant). Do NOT list multiple items separated by "and".
+9. You MUST give an answer from the context. NEVER say "unknown", "not provided", or "cannot determine".
+10. Copy exact strings from the context. Do NOT paraphrase or reformat.
+
+Context:
+{context}
+
+Question: {question}
+Answer:"""
+
+        if 'qwen3' in self.model_name.lower():
+            prompt += " /no_think"
+
+        try:
+            tokens = 500 if 'qwen3' in self.model_name.lower() else 50
+            answer = call_llm(prompt, model=self.model_name, max_tokens=tokens, temperature=temperature)
+            return self._clean_answer(answer)
+        except Exception:
+            return ""
 
 
 def main():
