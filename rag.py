@@ -27,10 +27,7 @@ class RAGPipeline:
         self.top_k_dense = top_k_dense
         self.top_k_final = top_k_final
         self.datastore_dir = datastore_dir
-        self.reranker = None
-
         self._load_datastore()
-        self._load_reranker()
 
     def _load_datastore(self):
         """Load all datastore components."""
@@ -69,48 +66,6 @@ class RAGPipeline:
             self.url_to_chunks[url].append(i)
 
         print(f"Datastore loaded: {len(self.chunks)} chunks")
-
-    def _load_reranker(self):
-        """Load cross-encoder re-ranker if available."""
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        local_reranker = os.path.join(script_dir, 'data', 'cross_encoder_model')
-        try:
-            from sentence_transformers import CrossEncoder
-            if os.path.exists(local_reranker):
-                self.reranker = CrossEncoder(local_reranker)
-            else:
-                self.reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-            print("Cross-encoder re-ranker loaded")
-        except Exception as e:
-            print(f"No re-ranker available: {e}")
-            self.reranker = None
-
-    def rerank(self, question, results, top_k=None, blend_weight=0.5):
-        """Re-rank results using cross-encoder blended with original scores."""
-        top_k = top_k or self.top_k_final
-        if not self.reranker or not results:
-            return results[:top_k]
-
-        pairs = [(question, self.chunks[idx]['text']) for idx, _ in results]
-        ce_scores = self.reranker.predict(pairs)
-
-        # Normalize both score sets to [0, 1]
-        orig_scores = np.array([s for _, s in results])
-        if orig_scores.max() > orig_scores.min():
-            orig_norm = (orig_scores - orig_scores.min()) / (orig_scores.max() - orig_scores.min())
-        else:
-            orig_norm = np.ones_like(orig_scores)
-
-        ce_arr = np.array(ce_scores)
-        if ce_arr.max() > ce_arr.min():
-            ce_norm = (ce_arr - ce_arr.min()) / (ce_arr.max() - ce_arr.min())
-        else:
-            ce_norm = np.ones_like(ce_arr)
-
-        # Blend: higher weight = more cross-encoder influence
-        blended = (1 - blend_weight) * orig_norm + blend_weight * ce_norm
-        ranked = sorted(zip(results, blended), key=lambda x: x[1], reverse=True)
-        return [(idx, float(score)) for (idx, _), score in ranked[:top_k]]
 
     def retrieve_bm25(self, query, top_k=None):
         """Retrieve top-k chunks using BM25."""
