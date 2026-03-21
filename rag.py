@@ -16,9 +16,9 @@ from llm import call_llm
 class RAGPipeline:
     def __init__(self, datastore_dir='data/datastore',
                  model_name=None,
-                 top_k_bm25=30,
-                 top_k_dense=30,
-                 top_k_final=12):
+                 top_k_bm25=50,
+                 top_k_dense=50,
+                 top_k_final=15):
         if model_name is None:
             self.model_name = os.environ.get('LLM_MODEL', 'qwen/qwen3-8b')
         else:
@@ -114,7 +114,7 @@ class RAGPipeline:
         # Build context string
         context_parts = []
         total_len = 0
-        max_context_len = 8000
+        max_context_len = 12000
         for i, (idx, score) in enumerate(context_chunks):
             chunk = self.chunks[idx]
             part = f"[{i+1}] {chunk['text']}"
@@ -125,17 +125,17 @@ class RAGPipeline:
 
         context = '\n\n'.join(context_parts)
 
-        prompt = f"""Answer the question about UC Berkeley EECS using the context below.
+        prompt = f"""You are answering factual questions about UC Berkeley EECS. Use ONLY the context below.
 
-Important: You MUST give a short, concrete answer. NEVER say "not provided", "no information", "unknown", "not mentioned", or "cannot determine". Always give your best guess from the context.
-
-Rules:
-- Answer with a short span: a name, number, date, or phrase (under 10 words)
-- For yes/no questions, answer only Yes or No
-- For counting questions, count carefully and answer with just the number
-- For questions about a specific person, find that exact person's information
-- Include full identifiers (e.g., "CS 161" not "161")
-- Do NOT explain your answer
+CRITICAL RULES:
+1. Give the SHORTEST possible answer: a name, number, date, or short phrase.
+2. Use digits for numbers (e.g., "4" not "Four").
+3. For yes/no questions, answer ONLY "Yes" or "No".
+4. For counting questions, carefully count ALL matching items in the context.
+5. Use FULL names with middle initials exactly as they appear in context.
+6. Include full identifiers (e.g., "CS 161" not "161", "EE 247A" not "EE 247").
+7. Do NOT add explanations. Do NOT start with "The" or "It is". Just the answer.
+8. You MUST give an answer. NEVER say "unknown", "not provided", or "cannot determine".
 
 Context:
 {context}
@@ -148,7 +148,8 @@ Answer:"""
             prompt += " /no_think"
 
         try:
-            answer = call_llm(prompt, model=self.model_name, max_tokens=50, temperature=0.0)
+            tokens = 500 if 'qwen3' in self.model_name.lower() else 50
+            answer = call_llm(prompt, model=self.model_name, max_tokens=tokens, temperature=0.0)
             answer = self._clean_answer(answer)
             return answer
         except Exception as e:
@@ -160,6 +161,15 @@ Answer:"""
         if not answer:
             return ""
         answer = answer.strip()
+
+        # Remove Qwen3 thinking tags
+        if '<think>' in answer:
+            # Remove everything between <think> and </think>
+            import re
+            answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip()
+            # If there's an unclosed <think> tag, take everything after it
+            if '<think>' in answer:
+                answer = answer.split('<think>')[0].strip()
 
         # Take only the first line
         answer = answer.split('\n')[0].strip()
@@ -173,7 +183,8 @@ Answer:"""
                            '**', 'So, ', 'Therefore, ', 'Thus, ',
                            'Based on the context, ', 'According to the context, ',
                            'Based on the provided context, ',
-                           'From the context, ']:
+                           'From the context, ', 'Complete the ',
+                           'It is ', 'They are ']:
                 if answer.lower().startswith(prefix.lower()):
                     answer = answer[len(prefix):].strip()
                     changed = True
@@ -187,12 +198,29 @@ Answer:"""
         if answer.endswith('.'):
             answer = answer[:-1].strip()
 
+        # Convert number words to digits
+        number_words = {
+            'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4',
+            'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9',
+            'ten': '10', 'eleven': '11', 'twelve': '12', 'thirteen': '13',
+            'fourteen': '14', 'fifteen': '15', 'sixteen': '16', 'seventeen': '17',
+            'eighteen': '18', 'nineteen': '19', 'twenty': '20',
+        }
+        if answer.lower() in number_words:
+            answer = number_words[answer.lower()]
+
+        # Normalize phone numbers: strip leading +
+        if answer.startswith('+1(') or answer.startswith('+1 ('):
+            answer = answer[1:]
+
         # Detect refusals
         refusal_patterns = [
             'not provided', 'not mentioned', 'no information',
             'cannot determine', 'not specified', 'not stated',
             'not available', 'not found in', 'not clear from',
             'cannot be determined', 'insufficient information',
+            'no answer found', 'cannot be answered',
+            'no answer provided',
         ]
         answer_lower = answer.lower()
         for pattern in refusal_patterns:
@@ -231,12 +259,51 @@ Answer:"""
         sorted_results = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
         return sorted_results[:top_k]
 
+    def _boost_same_url(self, results, top_k=None):
+        """For counting/listing questions, include more chunks from the top URL."""
+        top_k = top_k or self.top_k_final
+        if not results:
+            return results
+
+        # Find the top URL
+        top_url = self.chunks[results[0][0]]['url']
+        result_idxs = set(idx for idx, _ in results)
+
+        # Find all chunks from the same URL
+        boosted = list(results)
+        for i, chunk in enumerate(self.chunks):
+            if chunk['url'] == top_url and i not in result_idxs:
+                boosted.append((i, 0.001))  # low score but included
+
+        return boosted[:top_k * 2]  # allow more chunks for counting
+
     def answer_question(self, question):
         """Full RAG pipeline: retrieve + generate."""
         results = self.retrieve_multi_query(question)
         if not results:
             return ""
+
+        # For counting/listing questions, boost chunks from the same page
+        q_lower = question.lower()
+        if any(kw in q_lower for kw in ['how many', 'how much', 'list', 'what are']):
+            results = self._boost_same_url(results)
+
         answer = self.generate_answer(question, results)
+
+        # If answer is empty, try fallback model if configured
+        if not answer:
+            fallback_model = os.environ.get('FALLBACK_LLM_MODEL', '')
+            if fallback_model:
+                orig_model = self.model_name
+                self.model_name = fallback_model
+                answer = self.generate_answer(question, results)
+                self.model_name = orig_model
+
+        # If still empty, retry with more context
+        if not answer:
+            expanded = self._boost_same_url(results, top_k=self.top_k_final * 2)
+            answer = self.generate_answer(question, expanded)
+
         return answer
 
 

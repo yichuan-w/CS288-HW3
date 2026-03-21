@@ -31,8 +31,14 @@ def chunk_text(text, url, title, chunk_size=300, overlap=50):
         chunk_words = words[start:end]
         chunk_text = ' '.join(chunk_words)
 
+        # Prepend title to each chunk for better retrieval context
+        if title:
+            full_text = f"[{title}] {chunk_text}"
+        else:
+            full_text = chunk_text
+
         chunks.append({
-            'text': chunk_text,
+            'text': full_text,
             'url': url,
             'title': title,
             'start_word': start,
